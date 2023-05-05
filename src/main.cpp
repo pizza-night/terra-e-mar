@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-std::string username = "jff";
+std::string username;
 
 class Peer {
   private:
@@ -97,7 +97,7 @@ class Peers {
         close(socket);
     }
 
-    int broadcast_message(std::string message) {
+    int broadcast_message(std::string_view message) {
         std::vector<uint8_t> packet;
         packet.push_back(0);
         uint32_t size = htonl(message.size());
@@ -110,17 +110,17 @@ class Peers {
         return this->broadcast_packet(packet.data(), packet.size());
     }
 
-    int broadcast_username(std::string user) {
+    int broadcast_username(std::string_view user) {
         std::vector<uint8_t> packet;
         packet.push_back(1);
-        packet.push_back(user.length());
+        packet.push_back((uint8_t) user.length());
         packet.insert(packet.end(), user.begin(), user.end());
         return this->broadcast_packet(packet.data(), packet.size());
     }
 
     int send_known_peers(int socket) {
         std::vector<uint8_t> packet;
-        packet.push_back(3);
+        packet.push_back(2);
         // TODO: generate packet
         return this->find(socket).send_packet(packet.data(), packet.size());
     }
@@ -138,16 +138,15 @@ int read_from_socket(Peers& known_peers, int socket) {
         switch (packet_type[0]) {
             case 0: {
                 uint8_t packet_size[4];
-                if (int size = known_peers.receive(socket, packet_size, 4, 0) != 4) {
+                if (known_peers.receive(socket, packet_size, 4, 0) != 4) {
                     return -1;
                 };
                 uint32_t packet_size_parsed = ntohl(*(uint32_t*) packet_size);
 
                 std::vector<uint8_t> packet_message(packet_size_parsed + 1);
 
-                if (int size =
-                        known_peers.receive(socket, packet_message.data(), packet_size_parsed, 0) !=
-                        packet_size_parsed) {
+                if (known_peers.receive(socket, packet_message.data(), packet_size_parsed, 0) !=
+                    packet_size_parsed) {
                     return -1;
                 };
 
@@ -159,9 +158,21 @@ int read_from_socket(Peers& known_peers, int socket) {
                 break;
             }
             case 1: {
-                char packet_size[1];
-                int size = known_peers.receive(socket, packet_size, 1, 0);
-                std::cout << "Username\n";
+                uint8_t packet_size;
+                if (known_peers.receive(socket, &packet_size, 1, 0) != 1) {
+                    return -1;
+                }
+
+                std::vector<char> packet_username(packet_size);
+
+                if (known_peers.receive(socket, packet_username.data(), packet_size, 0) !=
+                    packet_size) {
+                    return -1;
+                };
+
+                auto usr = std::string(packet_username.begin(), packet_username.end());
+                std::cout << "Username update to " << usr << "\n";
+                known_peers.find(socket).username = usr;
                 break;
             }
             case 2:
@@ -260,10 +271,12 @@ auto main(int argc, char** argv) -> int {
 
     std::thread t_accept([&] { accept_con(known_peers, listening); });
 
+    username = "jff" + std::to_string(port);
+
     std::string message;
     while (std::getline(std::cin, message)) {
-        /* known_peers.broadcast_username(username); */
 
+        known_peers.broadcast_username(username);
         known_peers.broadcast_message(message);
     }
 
