@@ -31,12 +31,12 @@ class Peer {
 
     Peer(sockaddr_in addr, int socket): addr(addr), socket(socket) { generate_username(); }
 
-    /* ~Peer() { */
-    /*     close(this->socket); */
-    /* }; */
+    /* Peer(const Peer&) = delete; */
+    /* Peer& operator=(const Peer&) = delete; */
+    /* ~Peer() { close(this->socket); }; */
 
-    int send_packet(const char* bytes, uint32_t size) {
-        if (send(this->socket, bytes, size + 1, 0) == -1) {
+    int send_packet(const uint8_t* bytes, uint32_t size) {
+        if (send(this->socket, bytes, size, 0) == -1) {
             std::perror("Failed send_packet");
             return -1;
         }
@@ -46,7 +46,10 @@ class Peer {
 
 class Peers {
   private:
-    int broadcast_packet(const char* bytes, uint32_t size) {
+    std::mutex lock;
+    std::unordered_map<uint32_t, Peer> peers;
+
+    int broadcast_packet(const uint8_t* bytes, uint32_t size) {
         std::unique_lock guard(this->lock);
         for (auto& pair : this->peers) {
             if (pair.second.send_packet(bytes, size) == -1) {
@@ -58,9 +61,6 @@ class Peers {
     }
 
   public:
-    std::mutex lock;
-    std::unordered_map<uint32_t, Peer> peers;
-
     void insert(sockaddr_in addr, int socket) {
         std::unique_lock guard(this->lock);
         this->peers.emplace(socket, Peer(addr, socket));
@@ -75,22 +75,43 @@ class Peers {
         return search->second;
     }
 
+    auto receive(int socket, void* buf, uint32_t n, int flags) -> int {
+        int size = recv(socket, buf, n, flags);
+        if (size == -1) {
+            perror("There was a connection issue.");
+            this->remove(socket);
+            return -1;
+        }
+        if (size == 0) {
+            perror("User disconnected");
+            this->remove(socket);
+            return -1;
+        }
+
+        return size;
+    }
+
     void remove(int socket) {
         std::unique_lock guard(this->lock);
         this->peers.erase(this->peers.find(socket));
+        close(socket);
     }
 
     int broadcast_message(std::string message) {
-        std::vector<char> packet;
+        std::vector<uint8_t> packet;
         packet.push_back(0);
-        // TODO: fix message size
-        packet.push_back(message.length());
+        uint32_t size = htonl(message.size());
+
+        uint8_t a[4];
+        memcpy(a, &size, sizeof(size));
+        packet.insert(packet.end(), a, a + 4);
+
         packet.insert(packet.end(), message.begin(), message.end());
         return this->broadcast_packet(packet.data(), packet.size());
     }
 
     int broadcast_username(std::string user) {
-        std::vector<char> packet;
+        std::vector<uint8_t> packet;
         packet.push_back(1);
         packet.push_back(user.length());
         packet.insert(packet.end(), user.begin(), user.end());
@@ -98,7 +119,7 @@ class Peers {
     }
 
     int send_known_peers(int socket) {
-        std::vector<char> packet;
+        std::vector<uint8_t> packet;
         packet.push_back(3);
         // TODO: generate packet
         return this->find(socket).send_packet(packet.data(), packet.size());
@@ -107,33 +128,42 @@ class Peers {
 
 int read_from_socket(Peers& known_peers, int socket) {
 
-    char buf[4096];
     while (true) {
-        memset(buf, 0, 4096);
-        int size = recv(socket, buf, 4096, 0);
-        if (size == -1) {
-            perror("There was a connection issue.");
-            known_peers.remove(socket);
+        uint8_t packet_type[1];
+
+        if (int size = known_peers.receive(socket, packet_type, 1, 0) != 1) {
             return -1;
-        }
-        if (size == 0) {
-            perror("The client disconnected");
-            known_peers.remove(socket);
-            return 0;
-        }
+        };
 
-        // display message
+        switch (packet_type[0]) {
+            case 0: {
+                uint8_t packet_size[4];
+                if (int size = known_peers.receive(socket, packet_size, 4, 0) != 4) {
+                    return -1;
+                };
+                uint32_t packet_size_parsed = ntohl(*(uint32_t*) packet_size);
 
-        auto const& user = known_peers.find(socket);
-        std::cout << "Received " << user.username << ": " << std::string(buf, 0, size);
+                std::vector<uint8_t> packet_message(packet_size_parsed + 1);
 
-        switch (buf[0]) {
-            case 0:
-                std::cout << "Message\n";
+                if (int size =
+                        known_peers.receive(socket, packet_message.data(), packet_size_parsed, 0) !=
+                        packet_size_parsed) {
+                    return -1;
+                };
+
+                packet_message[packet_size_parsed + 1] = 0;
+
+                auto const& user = known_peers.find(socket);
+                std::cout << ">" << user.username << ": " << packet_message.data() << "\n";
+
                 break;
-            case 1:
+            }
+            case 1: {
+                char packet_size[1];
+                int size = known_peers.receive(socket, packet_size, 1, 0);
                 std::cout << "Username\n";
                 break;
+            }
             case 2:
                 std::cout << "Initial\n";
                 break;
@@ -163,9 +193,9 @@ void accept_con(Peers& known_peers, int listening) {
         known_peers.insert(client, socket);
         std::cout << "New Peer Connected: " << known_peers.find(socket).username << "\n";
 
-        if (known_peers.send_known_peers(socket) == -1) {
-            continue;
-        }
+        /* if (known_peers.send_known_peers(socket) == -1) { */
+        /*     continue; */
+        /* } */
 
         read_threads.emplace_back([&] { read_from_socket(known_peers, socket); });
     }
@@ -174,9 +204,15 @@ void accept_con(Peers& known_peers, int listening) {
 auto main(int argc, char** argv) -> int {
 
     int listening = socket(AF_INET, SOCK_STREAM, 0);
+
     if (listening == -1) {
         perror("Can't create a socket!");
         return -1;
+    }
+
+    int enable = 1;
+    if (setsockopt(listening, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
+        perror("setsockopt(SO_REUSEADDR) failed");
     }
 
     int port = (argc > 1) ? atoi(argv[1]) : 2504;
@@ -198,39 +234,36 @@ auto main(int argc, char** argv) -> int {
 
     Peers known_peers;
 
-    /* if (port != 2504) { */
-    /*     struct sockaddr_in server_addr; // set server addr and port */
-    /*     server_addr.sin_family = AF_INET; */
-    /*     server_addr.sin_port = htons(2504); */
-    /*     inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr); */
+    if (port != 2504) {
+        int connecting = socket(AF_INET, SOCK_STREAM, 0);
+        if (connecting == -1) {
+            perror("Can't create a socket!");
+            return -1;
+        }
 
+        struct sockaddr_in server_addr; // set server addr and port
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(2504);
+        struct hostent* hostnm = gethostbyname("localhost");
+        server_addr.sin_addr.s_addr = *((unsigned long*) hostnm->h_addr);
 
-    /*     int socket = connect(listening, (struct sockaddr*) &server_addr, sizeof(server_addr)); */
-    /*     if (socket == -1) { */
-    /*         perror("Problem with client connecting!"); */
-    /*         return -1;; */
-    /*     } */
+        if (connect(connecting, (struct sockaddr*) &server_addr, sizeof(server_addr)) == -1) {
+            perror("Problem with client connecting!");
+            return -1;
+            ;
+        }
 
-    /*     known_peers.insert(server_addr, socket); */
+        known_peers.insert(server_addr, connecting);
 
-    /*     std::string bytes("qweqweqweqwe"); */
-
-    /*     if (send(socket, bytes.c_str(), bytes.length() + 1, 0) == -1) { */
-    /*         std::perror("Failed send_packet"); */
-    /*         return -1; */
-    /*     } */
-    /*     std::cout << known_peers.peers.size() << "\n"; */
-    /* } */
+        read_threads.emplace_back([&] { read_from_socket(known_peers, connecting); });
+    }
 
     std::thread t_accept([&] { accept_con(known_peers, listening); });
 
-    while (true) {
-        std::string message;
-        std::cin >> message;
-
-        std::cout << known_peers.peers.size() << "\n";
-
+    std::string message;
+    while (std::getline(std::cin, message)) {
         /* known_peers.broadcast_username(username); */
+
         known_peers.broadcast_message(message);
     }
 
